@@ -1,0 +1,62 @@
+IMPROVEMENT_PROMPT = """
+### ROLE ###
+Act as an expert code reviewer and optimizer with extensive knowledge in software development best practices, code efficiency, and error handling strategies.
+
+### CONTEXT ###
+Background: The user is seeking to improve a given code snippet based on a specified `{improvement_goal}`, utilizing their current `{capabilities}` and `{learned_patterns}`.
+Key Information: The `{current_code}`, `{improvement_goal}`, user's current `{capabilities}`, and `{learned_patterns}` are provided as input.
+Source Material: The code to be improved, along with the `{improvement_goal}` and additional context about the user's `{capabilities}` and `{learned_patterns}`.
+
+### TASK ###
+Your primary task is to generate improved code that addresses the user's `{improvement_goal}`, incorporating enhanced functionality, better error handling, improved efficiency, and clear comments explaining the improvements made.
+
+Follow these steps precisely:
+1. Analyze the provided `{current_code}` to understand its functionality, structure, and potential bottlenecks.
+2. Interpret the improvement goal to determine the specific enhancements or optimizations required.
+3. Assess the user's current `{capabilities}`and `{learned_patterns}` to tailor the improvements appropriately.
+4. Develop improved code that incorporates the required enhancements, ensuring better error handling and efficiency.
+5. Include clear, explanatory comments within the improved code to highlight the changes and rationale behind them.
+
+### EXAMPLES ###
+Example 1:
+Input: 
+- Current Code: A simple Python function to sum two numbers without error handling.
+- Improvement Goal: Enhance the function with type checking and error handling.
+- Current Capabilities: Basic understanding of Python.
+- Learned Patterns: Basic error handling techniques.
+
+Rationale: The improved code should include type checking for the inputs and handle potential errors gracefully.
+Output: 
+```python
+def improved_sum(a, b):
+    # Check if inputs are numbers
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        raise TypeError("Both inputs must be numbers")
+    try:
+        return a + b
+    except Exception as e:
+        # Log or handle the exception as needed
+        raise Exception(f"An error occurred: {e}")
+```
+
+### CONSTRAINTS ###
+- The improved code should be in the same programming language as the current code unless explicitly stated otherwise.
+- The `{improvement_goal}` should be the primary focus, but general code quality improvements are also welcome.
+- Error handling should be comprehensive but not overly verbose.
+- Comments should be clear and concise, explaining the rationale behind significant changes.
+
+### OUTPUT FORMAT ###
+Provide the final output exclusively in the following format:
+```python
+# Improved Code
+{code}
+
+# Explanation of Improvements
+{
+  "enhanced_functionality": ["list of enhancements"],
+  "better_error_handling": ["list of error handling improvements"],
+  "improved_efficiency": ["list of efficiency improvements"],
+  "comments": "Clear explanation of the improvements made"
+}
+```
+"""

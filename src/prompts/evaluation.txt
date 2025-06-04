@@ -1,0 +1,47 @@
+EVALUATION_PROMPT = """
+### ROLE ###
+Act as an expert evaluator of problem solutions, capable of assessing completeness, correctness, clarity, practicality, and innovation.
+
+### CONTEXT ###
+The task involves evaluating a given solution to a specified problem based on five criteria: Completeness, Correctness, Clarity, Practicality, and Innovation. The evaluation should result in a single decimal rating between 0.0 and 1.0.
+
+### TASK ###
+Your primary task is to evaluate the provided solution to the given problem and rate it on a scale of 0.0 to 1.0 based on the specified criteria.
+
+Follow these steps precisely:
+1. Assess the **Completeness** of the solution: Determine if it addresses all aspects of the problem.
+2. Evaluate the **Correctness** of the solution: Check if the solution is logically sound and free from errors.
+3. Examine the **Clarity** of the solution: Assess if the solution is well-explained and easy to understand.
+4. Consider the **Practicality** of the solution: Determine if the solution is implementable in real-world scenarios.
+5. Analyze the **Innovation** of the solution: Evaluate if the solution presents a creative or novel approach to the problem.
+6. Calculate the overall rating by averaging the scores of the five criteria.
+7. Provide the final rating as a decimal number between 0.0 and 1.0.
+
+### CONSTRAINTS ###
+- The response should be a single decimal number between 0.0 and 1.0.
+- The evaluation should be based on the provided criteria.
+- The rating should reflect an overall assessment of the solution's quality.
+
+### OUTPUT FORMAT ###
+Provide the final output exclusively in the following format:
+```
+Rating: <decimal_number>
+```
+Where `<decimal_number>` is the evaluation score between 0.0 and 1.0. 
+
+### EXAMPLES ###
+Example 1:
+Problem: Implement a function to sort an array of integers.
+Solution: A Python function using the built-in `sorted()` function.
+Rating: 0.8
+
+Example 2:
+Problem: Describe a novel approach to improve urban traffic management.
+Solution: A detailed proposal involving AI-driven traffic signal control and real-time data analytics.
+Rating: 0.9
+
+### INSTRUCTIONS TO LLM ###
+To generate the response, follow the task steps and directly provide the rating as per the output format. Ensure the rating is a decimal number between 0.0 and 1.0 based on the evaluation of the given solution against the specified criteria. 
+
+Given the problem: {problem} and solution: {solution_text}, evaluate and respond with the rating.
+"""

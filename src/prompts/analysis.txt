@@ -1,0 +1,54 @@
+ANALYSIS_PROMPT: str = """
+### ROLE ###
+Act as an expert task analyzer and prompt engineer.
+
+### CONTEXT ###
+Background: The user has provided a task description and requests a structured analysis of the task, including its complexity, required skills, potential challenges, recommended approach, and success criteria, formatted as JSON.
+Key Information: The task description is represented by the placeholder `{task}` within the given prompt.
+Source Material: The prompt itself serves as the primary source material.
+
+### TASK ###
+Your primary task is to generate a comprehensive JSON object that analyzes a given task description. The task description will be provided in place of `{task}`. You need to assess the task and provide the following elements:
+1. Task complexity on a scale of 1-10.
+2. Required skills to accomplish the task.
+3. Potential challenges that might be encountered.
+4. A recommended approach to tackle the task.
+5. Success criteria to evaluate the task's outcome.
+
+Follow these steps precisely:
+1. Analyze the given task description to understand its core requirements and objectives.
+2. Assess the task complexity based on factors like the clarity of the task, the amount of data involved, the need for domain-specific knowledge, and the complexity of the operations required.
+3. Identify the skills necessary to accomplish the task, considering both technical and soft skills.
+4. Enumerate potential challenges that could arise during task execution, such as data quality issues, ambiguity in task requirements, or resource constraints.
+5. Outline a recommended approach to tackle the task, including any necessary steps, tools, or methodologies.
+6. Define the success criteria that will be used to evaluate the task's outcome, ensuring they are measurable and relevant to the task's objectives.
+7. Format the analysis as a JSON object with the required fields: `complexity`, `skills`, `challenges`, `approach`, and `success_criteria`.
+
+### EXAMPLES ###
+Example 1:
+Input: "Develop a Python script to automate the process of sending weekly summary emails to stakeholders based on sales data from a MySQL database."
+Task Complexity: 7
+Required Skills: Python programming, MySQL, understanding of email protocols (SMTP), data analysis.
+Potential Challenges: Handling varying data quality, ensuring data privacy, configuring email server settings.
+Recommended Approach: Use Python's `mysql-connector` for database interactions, `smtplib` for email sending, and schedule the script using `cron` or a similar task scheduler.
+Success Criteria: The script successfully sends weekly summary emails with accurate sales data to the stakeholders without manual intervention.
+
+### CONSTRAINTS ###
+- The output must be in JSON format.
+- The analysis should be based on the task description provided in place of `{task}`.
+- Ensure the JSON object includes all the required fields: `complexity`, `skills`, `challenges`, `approach`, and `success_criteria`.
+
+### OUTPUT FORMAT ###
+Provide the final output exclusively in the following JSON format:
+```json
+{{
+  "complexity": <integer between 1 and 10>,
+  "skills": [<list of relevant skills>],
+  "challenges": [<list of potential challenges>],
+  "approach": "<detailed recommended approach>",
+  "success_criteria": "<clear and measurable success criteria>"
+}}
+```
+
+Task to analyze: {task}
+"""

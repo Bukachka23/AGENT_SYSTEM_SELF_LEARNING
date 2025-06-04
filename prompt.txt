@@ -1,0 +1,1626 @@
+# Role and Objective
+
+You are an expert code documentation assistant specializing in explaining software project modules in comprehensive, step-by-step detail.
+Your role is to analyze code modules and provide clear, educational explanations that help developers understand the structure, functionality, and purpose of each component.
+
+# Instructions
+
+## Core Analysis Framework
+- Examine each module's purpose, dependencies, and role within the larger project
+- Break down complex functionality into digestible, logical steps
+- Identify key design patterns, architectural decisions, and best practices
+- Explain both the "what" and "why" behind code implementations
+- Highlight relationships between different modules and components
+
+## Module Analysis Categories
+
+### 1. Structure Analysis
+- File organization and naming conventions
+- Import/export patterns and dependencies
+- Class hierarchies and inheritance relationships
+- Function/method organization and grouping
+
+### 2. Functionality Breakdown
+- Core responsibilities and business logic
+- Input/output specifications
+- Error handling and edge cases
+- Performance considerations and optimizations
+
+### 3. Integration Analysis
+- How the module interacts with other components
+- API contracts and interfaces
+- Data flow and communication patterns
+- External dependencies and third-party integrations
+
+### 4. Implementation Details
+- Key algorithms and data structures
+- Design patterns utilized
+- Configuration and customization options
+- Security considerations and best practices
+
+# Relevant Code Snippets
+
+configs.py
+```python
+import asyncio
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel
+
+
+class PostAnalysisConfig(BaseModel):
+    """Configuration for post analysis service."""
+
+    batch_size: int = 30
+    max_concurrent_tasks: int = 30
+    include_comments: bool = True
+    max_videos_per_post: int = 10
+
+    # Database filter configurations
+    min_crawled_date: Optional[datetime] = datetime(2025, 4, 10)
+    post_type_filter: Optional[str] = 'substack'
+    exclude_runway_posts: bool = True
+    only_posts_with_products: bool = True
+    only_image_chunks: bool = True
+
+    # General data limit
+    limit: int = 100
+
+    # Retry configurations
+    max_retries: int = 3
+    retry_delay: float = 1.0
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        """Create semaphore for concurrent task control."""
+        return asyncio.Semaphore(self.max_concurrent_tasks)
+
+```
+
+models.py
+```python
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+from pydantic import BaseModel
+
+
+class PostAnalysisData(BaseModel):
+    """Base model for post analysis data."""
+    post_id: int
+    content: Dict[str, Any]
+
+
+class PostContextData(BaseModel):
+    """Represents context data for a post."""
+    id: int
+    post_type: str
+    description: Optional[str]
+    details: Dict[str, Any]
+    timestamp: Optional[datetime]
+    sponsored: bool
+    chunks: List[Dict[str, Any]]
+    products: List[int] = []
+
+
+class AnalysisConfig(BaseModel):
+    """Configuration for post analysis."""
+    batch_size: int = 30
+    include_comments: bool = True
+    max_videos: int = 10
+
+```
+
+post_analysis.py
+```python
+import asyncio
+import re
+import weakref
+from collections import defaultdict
+from json import JSONDecodeError
+from typing import List, Dict, Any, Optional, Sequence
+
+from sqlalchemy import delete, text, Row, Integer
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import select
+
+from configs import PostAnalysisConfig
+from models import PostContextData
+from pipeline.src.shared.config import Config
+from pipeline.src.shared.database.database import Database
+from pipeline.src.shared.database.models import (
+    Chunk, Post, Product, PostAnalysis
+)
+from pipeline.src.shared.llm.gemini import GeminiLLMClient
+from pipeline.src.shared.logger import Logger
+from pipeline.src.shared.storage import S3CloudStorage
+from prompt import PROMPT
+from utils import Timer
+
+
+class PostAnalysisService:
+    def __init__(
+            self,
+            config: Config,
+            database: Database,
+            llm_client: GeminiLLMClient,
+            time: Timer,
+            logger: Logger,
+            analysis_config: PostAnalysisConfig = PostAnalysisConfig()
+    ):
+        self.config = config
+        self.database = database
+        self.llm_client = llm_client
+        self.logger = logger
+        self.time = time
+        self.analysis_config = analysis_config
+        self.storage = S3CloudStorage(config)
+        self._post_cache = weakref.WeakValueDictionary()
+
+
+    def _apply_query_filters(self, query):
+        """Apply configuration-based filters to the query."""
+        if self.analysis_config.exclude_runway_posts:
+            query = query.where(Post.post_type != 'runway')
+
+        if self.analysis_config.min_crawled_date:
+            query = query.where(Post.crawled_at >= self.analysis_config.min_crawled_date)
+
+        if self.analysis_config.post_type_filter:
+            query = query.where(Post.post_type == self.analysis_config.post_type_filter)
+
+        if self.analysis_config.only_posts_with_products:
+            query = query.where(Chunk.id.in_(select(Product.chunk_id).distinct()))  # noqa
+
+        if self.analysis_config.only_image_chunks:
+            query = query.where(Chunk.type == 'image')
+
+        return query
+
+    def _group_chunks_by_post(self, posts_w_chunks: List[tuple]) -> Dict[int, List[Dict]]:
+        """Group chunks by their post ID."""
+        chunks_to_posts = defaultdict(list)
+
+        for post, chunk in posts_w_chunks:
+            chunk_dict = self._clean_sqlalchemy_dict(chunk)
+
+            if self._should_skip_chunk(chunk):
+                continue
+
+            chunks_to_posts[chunk.post_id].append(chunk_dict)
+
+        return chunks_to_posts
+
+    def _clean_sqlalchemy_dict(self, obj) -> Dict:
+        """Remove SQLAlchemy instance state from object dictionary."""
+        obj_dict = obj.__dict__.copy()
+        obj_dict.pop('_sa_instance_state', None)
+        return obj_dict
+
+    def _should_skip_chunk(self, chunk) -> bool:
+        """Check if a chunk should be skipped based on media URLs."""
+        return ((chunk.image and chunk.image.startswith("http")) or
+                (chunk.video and chunk.video.startswith("http")))
+
+    def _create_posts_dict(self, posts_w_chunks: List[tuple], chunks_to_posts: Dict[int, List[Dict]]) -> Dict[
+        int, PostContextData]:
+        """Create dictionary of PostContextData objects."""
+        posts_dict = {}
+
+        for post, _ in posts_w_chunks:
+            if post.id in posts_dict:
+                continue
+
+            post_dict = self._clean_sqlalchemy_dict(post)
+
+            try:
+                post_data = PostContextData(
+                    **post_dict,
+                    chunks=chunks_to_posts[post.id]
+                )
+                posts_dict[post.id] = post_data
+            except Exception as e:
+                self.logger.warning(f"Skipping post {post.id} due to validation error: {str(e)}")
+                continue
+
+        return posts_dict
+
+    async def get_post_context(self, post: PostContextData, session: AsyncSession, as_md: bool = False,
+                               comments: bool = True) -> tuple[str | List[str], List[Dict[str, Any]]]:
+        """Generate context for a post with memory-efficient string building."""
+        try:
+            metrics = self._extract_post_metrics(post)
+
+            def generate_context_lines():
+                yield "# Attached Post"
+                yield ""
+                yield "## Post Metadata"
+                yield f" - Type: {post.post_type}"
+                yield f" - Sponsored: {post.sponsored}"
+
+                for key, value in metrics.items():
+                    if value and int(value) > 0 and key != 'comments_count':
+                        label = self._get_metric_label(key)
+                        if label:
+                            yield f"{label}: {value}"
+
+                if post.timestamp:
+                    yield f" - Date and time posted: {post.timestamp.isoformat().replace('T', ' ')}"
+                yield f" - Caption: {post.description or ''}"
+                yield ""
+
+                if comments and post.details.get('latestComments'):
+                    yield "## Comments From Other Users"
+                    yield ""
+                    for comment in post.details.get('latestComments', []):
+                        yield f"{comment['text']} ({comment.get('likesCount', 0)} likes)"
+                    yield ""
+
+            context_lines = list(generate_context_lines())
+
+            is_substack = post.post_type == "substack"
+            context_lines.append(
+                "## Text, Products and Media files" if not is_substack
+                else "## Post full text, images and extracted product mentions"
+            )
+
+            chunk_ids = [c['id'] for c in post.chunks]
+            products_to_chunk = await self._fetch_and_organize_products_efficient(chunk_ids, session)
+
+            media_items = []
+            if is_substack:
+                async for content_chunk in self._process_substack_content_stream(post, products_to_chunk, session):
+                    context_lines.extend(content_chunk)
+            else:
+                async for content_chunk, media_item in self._process_regular_content_stream(post, products_to_chunk,
+                                                                                            as_md):
+                    context_lines.extend(content_chunk)
+                    if media_item:
+                        media_items.append(media_item)
+
+            context_lines.append("--- end of Attached Post ---")
+
+            return ("\n\n".join(context_lines) if as_md else context_lines), media_items
+
+        except Exception as e:
+            self.logger.error(f"Error generating post context for post {post.id}: {str(e)}")
+            raise
+
+    async def _fetch_and_organize_products_efficient(self, chunk_ids: List[int], session: AsyncSession) -> Dict[
+        int, List[Dict]]:
+        """Fetch and organize products with batching for large chunk lists."""
+        from collections import defaultdict
+        products_to_chunk = defaultdict(list)
+
+        # Process chunk IDs in batches to avoid huge IN clauses
+        batch_size = 100
+        for i in range(0, len(chunk_ids), batch_size):
+            batch_ids = chunk_ids[i:i + batch_size]
+
+            products_query = select(Product).where(Product.chunk_id.in_(batch_ids)) # noqa
+            products_result = await session.execute(products_query)
+            products = products_result.scalars().all()
+
+            for product in products:
+                product_dict = {
+                    'id': product.id,
+                    'name': product.name,
+                    'description': product.description,
+                    'chunk_id': product.chunk_id
+                }
+                products_to_chunk[product.chunk_id].append(product_dict)
+
+        return dict(products_to_chunk)
+
+    async def _process_regular_content_stream(self, post: PostContextData, products_to_chunk: Dict[int, List[Dict]],
+                                              as_md: bool):
+        """Stream regular content processing to avoid building large lists in memory."""
+        videos_processed = 0
+
+        for chunk in post.chunks:
+            # Skip excess videos
+            if chunk["type"] == "video":
+                videos_processed += 1
+                if videos_processed > self.analysis_config.max_videos_per_post:
+                    continue
+
+            # Yield content for this chunk
+            content_lines = [f"### Media ID: {chunk['id']}", ""]
+
+            # Process media efficiently
+            if chunk["type"] in ["video", "image"]:
+                if as_md:
+                    media_content = self._generate_markdown_media(chunk)
+                    content_lines.extend([media_content, ""])
+                    media_item = None
+                else:
+                    # Stream media processing
+                    media_item = await self._prepare_media_item_streaming(chunk)
+                    if media_item:
+                        content_lines.append(f"[Media ID: {chunk['id']} - see attached media]")
+                    else:
+                        content_lines.append(f"[Media ID: {chunk['id']} - failed to load]")
+                    content_lines.append("")
+            else:
+                media_item = None
+
+            # Add products if any
+            chunk_products = products_to_chunk.get(chunk['id'], [])
+            if chunk_products:
+                content_lines.extend(["#### Products on the media", ""])
+                for product in chunk_products:
+                    content_lines.extend([
+                        f"\n##### Product ID: {product['id']}\n",
+                        f" - Name: {product.get('name', 'N/A')}",
+                        f" - Description: {product.get('description', 'N/A')}",
+                        "",
+                        f"--- end of Product ID: {product['id']} ---"
+                    ])
+                content_lines.append("")
+
+            content_lines.append(f"--- end of Media ID: {chunk['id']} ---")
+
+            if chunk.get("text"):
+                content_lines.extend(["", chunk["text"], ""])
+
+            yield content_lines, media_item
+
+    async def _prepare_media_item_streaming(self, chunk: Dict, max_size: int = 50 * 1024 * 1024) \
+            -> Optional[Dict[str, Any]]:
+        """Download and prepare media with streaming and size limits."""
+        try:
+            media_key = chunk.get("video") or chunk.get("image", "")
+            if not media_key:
+                return None
+
+            chunks = []
+            total_size = 0
+            chunk_size = 1024 * 1024
+
+            async for data_chunk in self.storage.stream_download(media_key, chunk_size=chunk_size):
+                total_size += len(data_chunk)
+
+                if total_size > max_size:
+                    self.logger.warning(f"Media file too large ({total_size} bytes), skipping: {media_key}")
+                    return None
+
+                chunks.append(data_chunk)
+
+            file_data = b''.join(chunks)
+            extension = media_key.split('.')[-1].lower() if '.' in media_key else 'jpg'
+            result = {"file": file_data, "extension": extension}
+            del chunks
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Error preparing media item: {str(e)}")
+            return None
+
+    async def _process_substack_content_stream(self, post: PostContextData, products_to_chunk: Dict[int, List[Dict]],
+                                               session: AsyncSession):
+        """Stream process substack content to avoid building large strings in memory."""
+        try:
+            # Fetch substack chunks efficiently
+            substack_chunks = await self._fetch_substack_chunks_optimized(post.id, session)
+            substack_img_chunks, substack_links = self._organize_substack_chunks(list(substack_chunks))
+
+            # Create link replacer
+            link_replacer = self._create_markdown_link_replacer(substack_links, products_to_chunk)
+
+            # Process paragraphs in chunks
+            raw_text = post.details.get('raw_text', '')
+            paragraphs = raw_text.split('\n\n')
+
+            # Process in batches to avoid memory buildup
+            batch_size = 10
+            for i in range(0, len(paragraphs), batch_size):
+                batch_content = []
+
+                for paragraph in paragraphs[i:i + batch_size]:
+                    chunk_id = None
+                    is_image = paragraph.startswith('[![](')
+
+                    if is_image and paragraph in substack_img_chunks:
+                        chunk_id = substack_img_chunks[paragraph].id
+                        batch_content.append(f"### Media ID: {chunk_id}")
+
+                    batch_content.append(link_replacer(paragraph))
+
+                    # Add products if any
+                    if chunk_id:
+                        chunk_products = products_to_chunk.get(chunk_id, [])
+                        if chunk_products:
+                            batch_content.extend([
+                                "#### Extracted products from media file",
+                                *self._format_products_list_efficient(chunk_products),
+                                ""
+                            ])
+
+                    if is_image and chunk_id:
+                        batch_content.append(f"--- end of Media ID: {chunk_id} ---")
+
+                    batch_content.append("")
+
+                yield batch_content
+
+        except Exception as e:
+            self.logger.error(f"Error processing substack content: {str(e)}")
+            yield []
+
+    def _format_products_list_efficient(self, products: List[Dict]) -> List[str]:
+        """Format products list using generator for memory efficiency."""
+
+        def generate_product_lines():
+            for product in products:
+                yield f"\n##### Product ID: {product['id']}\n"
+                yield f" - Name: {product.get('name', 'N/A')}"
+                yield f" - Description: {product.get('description', 'N/A')}"
+                yield ""
+                yield ""
+                yield f"--- end of Product ID: {product['id']} ---"
+
+        return list(generate_product_lines())
+
+    async def _fetch_substack_chunks_optimized(self, post_id: int, session: AsyncSession):
+        """Fetch substack chunks with parameterized query for security."""
+        from sqlalchemy import bindparam
+
+        substack_query = text("""
+            SELECT details->>'paragraph' as paragraph, c.external_id, c.id, c.type
+            FROM chunk c
+            WHERE post_id = :post_id
+        """).bindparams(bindparam('post_id', value=post_id, type_=Integer))
+
+        result = await session.execute(substack_query)
+        return result.fetchall()
+
+    def _get_metric_label(self, key: str) -> Optional[str]:
+        """Get label for metric key."""
+        labels = {
+            "likes_count": " - Likes count",
+            "shares_count": " - Shares count",
+            "plays_count": " - Plays count",
+            "collect_count": " - Collect count"
+        }
+        return labels.get(key)
+
+    def _extract_post_metrics(self, post: PostContextData) -> Dict[str, int]:
+        """Extract engagement metrics from post details."""
+        return {
+            "likes_count": post.details.get('like_count', post.details.get('likesCount', 0)),
+            "comments_count": post.details.get('commentsCount', post.details.get('commentCount', 0)),
+            "shares_count": post.details.get('shareCount', 0),
+            "plays_count": post.details.get('playCount', 0),
+            "collect_count": post.details.get('collectCount', 0)
+        }
+
+
+    def _format_metrics(self, metrics: Dict[str, int]) -> List[str]:
+        """Format metrics for display."""
+        metric_labels = {
+            "likes_count": " - Likes count",
+            "comments_count": " - Comments count",
+            "shares_count": " - Shares count",
+            "plays_count": " - Plays count",
+            "collect_count": " - Collect count"
+        }
+
+        return [
+            f"{metric_labels[key]}: {value}"
+            for key, value in metrics.items()
+            if value and int(value) > 0 and key != 'comments_count'
+        ]
+
+    def _format_comments(self, comments: List[Dict]) -> str:
+        """Format comments for display."""
+        return "\n\n".join([
+            f"{c['text']} ({c.get('likesCount', 0)} likes)"
+            for c in comments
+        ])
+
+    async def _fetch_products_by_chunk_ids(self, chunk_ids: List[int], session: AsyncSession) -> Sequence[Product]:
+        """Fetch products by chunk IDs."""
+        products_query = select(Product).where(Product.chunk_id.in_(chunk_ids))  # noqa
+        products_result = await session.execute(products_query)
+        return products_result.scalars().all()
+
+    def _organize_products_by_chunk(self, products: List[Product]) -> Dict[int, List[Dict]]:
+        """Organize products by their chunk ID."""
+        products_to_chunk = defaultdict(list)
+        for product in products:
+            product_dict = self._clean_sqlalchemy_dict(product)
+            products_to_chunk[product.chunk_id].append(product_dict)
+        return products_to_chunk
+
+    async def _fetch_substack_chunks(self, post_id: int, session: AsyncSession) -> Sequence[Row[tuple[Any, ...] | Any]]:
+        """Fetch substack chunks with raw SQL."""
+        substack_query = text(f"""
+            SELECT details->>'paragraph' as paragraph, c.external_id, c.id, c.type
+            FROM chunk c
+            WHERE post_id = {post_id}
+        """)
+
+        result = await session.execute(substack_query)
+        return result.fetchall()
+
+    def _organize_substack_chunks(self, chunks: List[Row]) -> tuple[Dict, Dict]:
+        """Organize substack chunks into image chunks and links dictionaries."""
+        substack_img_chunks = {r.paragraph: r for r in chunks}
+        substack_links = {r.external_id: r for r in chunks}
+        return substack_img_chunks, substack_links
+
+    def _create_markdown_link_replacer(self, substack_links: Dict, products_to_chunk: Dict[int, List[Dict]]):
+        """Create a function to replace markdown links with product information."""
+
+        def replace_markdown_links(md_text: str) -> str:
+            pattern = re.compile(r'(?<!!)\[([^]]+)]\(([^)]+)\)')
+
+            def _replacement(match):
+                link_text = match.group(1)
+                if link_text.startswith("!["):
+                    return match.group(0)
+                link_address = match.group(2)
+
+                if link_address in substack_links:
+                    products = products_to_chunk.get(substack_links[link_address].id, [])
+                    if not products:
+                        return f"[{link_text}]('external link')"
+                    return f"([{link_text}](link to >>>Product ID: {products[0]['id']} , Title: {products[0]['name']}<<<))"
+
+                return f"[{link_text}]('external link')"
+
+            return pattern.sub(_replacement, md_text)
+
+        return replace_markdown_links
+
+    async def _process_substack_paragraph(self, paragraph: str, substack_img_chunks: Dict,
+                                          products_to_chunk: Dict[int, List[Dict]], link_replacer) -> List[str]:
+        """Process a single substack paragraph."""
+        content = []
+        chunk_id = None
+        is_image = paragraph.startswith('[![](')
+
+        if is_image and paragraph in substack_img_chunks:
+            chunk_id = substack_img_chunks[paragraph].id
+            content.append(f"### Media ID: {chunk_id}")
+
+        content.append(link_replacer(paragraph))
+
+        chunk_products = products_to_chunk.get(chunk_id, [])
+        if chunk_products:
+            content.extend([
+                "#### Extracted products from media file",
+                *self._format_products_list(chunk_products),
+                ""
+            ])
+
+        if is_image and chunk_id:
+            content.append(f"--- end of Media ID: {chunk_id} ---")
+
+        return content
+
+
+    async def _process_single_chunk(self, chunk: Dict, products_to_chunk: Dict[int, List[Dict]], as_md: bool) \
+            -> tuple[List[str], Optional[Dict[str, Any]]]:
+        """Process a single chunk and return its content and media item."""
+        content = []
+        media_item = None
+
+        media_content, media_item = await self._process_chunk_media(chunk, as_md)
+        content.extend([f"### Media ID: {chunk['id']}", "",])
+
+        if media_content:
+            content.extend([media_content, ""])
+
+        chunk_products = products_to_chunk.get(chunk['id'], [])
+        if chunk_products:
+            content.extend([
+                "#### Products on the media\n\n",
+                *self._format_products_list(chunk_products),
+                ""
+            ])
+
+        content.append(f"--- end of Media ID: {chunk['id']} ---")
+
+        if chunk.get("text"):
+            content.extend(["", chunk["text"], ""])
+
+        return content, media_item
+
+    async def _process_chunk_media(self, chunk: Dict, as_md: bool) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Process media content for a chunk."""
+        if chunk["type"] not in ["video", "image"]:
+            return "", None
+
+        if as_md:
+            return self._generate_markdown_media(chunk), None
+        else:
+            return await self._generate_api_media(chunk)
+
+    def _generate_markdown_media(self, chunk: Dict) -> str:
+        """Generate markdown representation of media."""
+        if chunk.get("video"):
+            return f'''<video width="320" height="240" controls>
+                <source src="{self.config.cloudfront_url}{chunk["video"]}" type="video/mp4">
+            </video>'''
+        else:
+            return f'<img src="{self.config.cloudfront_url}{chunk.get("image", "")}" width="200"/>'
+
+    async def _generate_api_media(self, chunk: Dict) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Generate API representation of media."""
+        media_url = self.config.cloudfront_url + (chunk.get("video") or chunk.get("image", ""))
+        media_item = await self._prepare_media_item(media_url)
+
+        if media_item is None:
+            self.logger.warning(f"Skipping media for chunk ID: {chunk['id']}")
+            return f"[Media ID: {chunk['id']} - failed to load]", None
+        else:
+            return f"[Media ID: {chunk['id']} - see attached media]", media_item
+
+    def _format_products_list(self, products: List[Dict]) -> List[str]:
+        """Format products list for display."""
+        formatted = []
+        for product in products:
+            formatted.extend([
+                f"\n##### Product ID: {product['id']}\n",
+                f" - Name: {product.get('name', 'N/A')}",
+                f" - Description: {product.get('description', 'N/A')}",
+                "",
+                "",
+                f"--- end of Product ID: {product['id']} ---"
+            ])
+        return formatted
+
+    async def _prepare_media_item(self, media_url: str) -> Optional[Dict[str, Any]]:
+        """Download media from S3 and prepare it for LLM processing."""
+        try:
+            s3_key = self._extract_s3_key(media_url)
+            file_data = await self._download_media_file(s3_key)
+
+            if file_data is None:
+                return None
+
+            extension = self._extract_file_extension(s3_key)
+
+            return {
+                "file": file_data,
+                "extension": extension
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error preparing media item for {media_url}: {str(e)}")
+            return None
+
+    def _extract_s3_key(self, media_url: str) -> str:
+        """Extract S3 key from CloudFront URL."""
+        return media_url.replace(self.config.cloudfront_url, "")
+
+    async def _download_media_file(self, s3_key: str) -> Optional[bytes]:
+        """Download file from S3."""
+        file_data = await self.storage.download_file(s3_key)
+        if file_data is None:
+            self.logger.warning(f"Failed to download media from S3: {s3_key}")
+        return file_data
+
+    def _extract_file_extension(self, s3_key: str) -> str:
+        """Extract file extension from S3 key."""
+        return s3_key.split('.')[-1].lower() if '.' in s3_key else 'jpg'
+
+    async def run_gemini_analysis(self, context: List[str], task_prompt: str,
+                                  media_items: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+        """Run Gemini analysis with proper error handling."""
+        try:
+            message = self._prepare_gemini_message(context, task_prompt, media_items)
+            result = await self._call_gemini_api([message])
+
+            if not self._validate_gemini_response(result):
+                return None
+
+            parsed_result = self._parse_gemini_response(result)
+            return parsed_result
+
+        except Exception as e:
+            self.logger.error(f"Error in Gemini analysis: {str(e)}")
+            return None
+
+    def _prepare_gemini_message(self, context: List[str], task_prompt: str,
+                                media_items: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+        """Prepare message for Gemini API."""
+        message = {"content": "\n".join(context + ["# Task", task_prompt])}
+        if media_items:
+            message["media_items"] = media_items
+        return message
+
+    async def _call_gemini_api(self, messages: List[Dict[str, Any]]) -> str:
+        """Call Gemini API and return raw result."""
+        return await self.llm_client.run(messages)
+
+    def _validate_gemini_response(self, result: str) -> bool:
+        """Validate Gemini API response."""
+        if not result:
+            self.logger.warning("Gemini API returned empty response")
+            return False
+
+        if not result.strip():
+            self.logger.warning("Gemini API returned empty/whitespace response")
+            return False
+
+        return True
+
+    def _parse_gemini_response(self, result: str) -> Optional[Dict[str, Any]]:
+        """Parse Gemini API response to extract JSON."""
+
+        result_stripped = result.strip()
+        parsed_result = self._try_direct_json_parse(result_stripped)
+        if parsed_result:
+            return parsed_result
+
+        parsed_result = self._try_extract_json_from_markdown(result)
+        if parsed_result:
+            return parsed_result
+
+        self.logger.error(f"Failed to parse response as JSON")
+        return None
+
+    def _try_direct_json_parse(self, text: str) -> Optional[Dict[str, Any]]:
+        """Try to parse text as direct JSON."""
+        import json
+
+        try:
+            if text.startswith('{') and text.endswith('}'):
+                parsed_result = json.loads(text)
+                self.logger.info(f"Successfully parsed Gemini response with {len(str(parsed_result))} characters")
+                return parsed_result
+        except JSONDecodeError as e:
+            self.logger.error(f"Direct JSON parse failed: {e}")
+
+        return None
+
+    def _try_extract_json_from_markdown(self, text: str) -> Optional[Dict[str, Any]]:
+        """Try to extract JSON from markdown code blocks."""
+        import json
+        import re
+
+        json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+        if json_match:
+            try:
+                parsed_result = json.loads(json_match.group(1))
+                self.logger.info("Successfully extracted JSON from markdown wrapper")
+                return parsed_result
+            except JSONDecodeError:
+                self.logger.error("Failed to parse JSON even after extracting from markdown")
+
+        return None
+
+    async def cleanup_base_table(self, session: AsyncSession, model_class, post_id: int):
+        """Clean up base table records for a post."""
+        try:
+            delete_query = delete(model_class).where(model_class.post_id == post_id)  # noqa
+            await session.execute(delete_query)
+            await session.flush()
+        except Exception as e:
+            self.logger.error(f"Error cleaning up {model_class.__name__} for post {post_id}: {str(e)}")
+            raise
+
+    async def generate_post_analysis(self, post: PostContextData) -> bool:
+        """Generate complete analysis for a post."""
+        try:
+            async with self.database.session_scope() as session:
+                context, media_items = await self.get_post_context(post, session, as_md=False, comments=True)
+
+                analysis_result = await self.run_gemini_analysis(context, PROMPT, media_items)
+
+                if analysis_result is None:
+                    self.logger.warning(f"Post {post.id} - comprehensive analysis failed")
+                    await self._save_failed_post_analysis(session, post,
+                                                          "LLM analysis returned empty or invalid response")
+                    await session.commit()
+                    return False
+
+                await self._save_post_analysis_results(session, post, analysis_result)
+                await session.commit()
+
+                return True
+
+        except Exception as e:
+            self.logger.error(f"Error analyzing post {post.id}: {str(e)}")
+            await self._handle_analysis_failure(post, str(e))
+            return False
+
+    async def _handle_analysis_failure(self, post: PostContextData, error_message: str):
+        """Handle analysis failure by saving error state."""
+        try:
+            async with self.database.session_scope() as session:
+                await self._save_failed_post_analysis(session, post, error_message)
+                await session.commit()
+        except Exception as save_error:
+            self.logger.error(f"Failed to save failed analysis for post {post.id}: {str(save_error)}")
+
+    async def _save_post_analysis_results(self, session: AsyncSession, post: PostContextData, analysis_result: Dict):
+        """Save comprehensive analysis results to the post_analysis table."""
+        try:
+            await self.cleanup_base_table(session, PostAnalysis, post.id)
+
+            cleaned_result = self._clean_analysis_result(analysis_result)
+            post_rationale = self._extract_post_rationale(analysis_result)
+
+            post_analysis = self._create_post_analysis_record(post.id, cleaned_result, post_rationale)
+
+            session.add(post_analysis)
+            await session.flush()
+
+            self._log_saved_analysis(post.id, cleaned_result)
+
+        except Exception as e:
+            self.logger.error(f"Error saving post analysis results for post {post.id}: {str(e)}")
+            raise
+
+    def _extract_post_rationale(self, analysis_result: Dict) -> str:
+        """Extract rationale from analysis result."""
+        post_summary = analysis_result.get('post_summary', {})
+        return post_summary.get('rationale_for_post', '')
+
+    def _create_post_analysis_record(self, post_id: int, cleaned_result: Dict, post_rationale: str) -> PostAnalysis:
+        """Create PostAnalysis record."""
+        return PostAnalysis(post_id=post_id, analysis_result=cleaned_result, post_rationale=post_rationale)
+
+    def _log_saved_analysis(self, post_id: int, cleaned_result: Dict):
+        """Log information about saved analysis."""
+        saved_sections = list(cleaned_result.keys())
+        self.logger.info(f"Successfully saved post analysis for post {post_id} - "
+                         f"sections: {saved_sections}")
+
+    async def _save_failed_post_analysis(self, session: AsyncSession, post: PostContextData,error_message: str):
+        """Save failed analysis attempt to the post_analysis table."""
+        try:
+            await self.cleanup_base_table(session, PostAnalysis, post.id)
+
+            post_analysis = PostAnalysis(
+                post_id=post.id,
+                analysis_result={
+                    'status': 'failed',
+                    'error': error_message[:200]
+                }
+            )
+
+            session.add(post_analysis)
+
+            self.logger.info(f"Saved failed analysis record for post {post.id}")
+
+        except Exception as e:
+            self.logger.error(f"Error saving failed post analysis for post {post.id}: {str(e)}")
+
+    def _clean_analysis_result(self, analysis_result: Dict) -> Dict:
+        """Clean analysis result by removing empty sections and unnecessary data."""
+        cleaned = {}
+
+        cleaned = self._add_post_summary_if_present(cleaned, analysis_result)
+        cleaned = self._add_content_sections_if_present(cleaned, analysis_result)
+        cleaned = self._add_sponsorship_section_if_present(cleaned, analysis_result)
+
+        return cleaned
+
+    def _add_post_summary_if_present(self, cleaned: Dict, analysis_result: Dict) -> Dict:
+        """Add post summary to cleaned result if it has meaningful content."""
+        post_summary = analysis_result.get('post_summary', {})
+        if post_summary.get('rationale_for_post'):
+            cleaned['post_summary'] = {'rationale_for_post': post_summary['rationale_for_post']}
+            topics = post_summary.get('key_topics_themes', [])
+            if topics:
+                cleaned['post_summary']['key_topics_themes'] = topics
+        return cleaned
+
+    def _add_content_sections_if_present(self, cleaned: Dict, analysis_result: Dict) -> Dict:
+        """Add content sections that have actual data."""
+        content_sections = [
+            'trend_identification',
+            'celebrity_style_spotlight',
+            'pop_culture_references',
+            'buzzwords',
+            'vintage_references',
+            'loving_and_hating',
+            'lifestyle_analysis'
+        ]
+
+        for section in content_sections:
+            data = analysis_result.get(section, [])
+            if data and len(data) > 0:
+                cleaned[section] = data
+
+        return cleaned
+
+    def _add_sponsorship_section_if_present(self, cleaned: Dict, analysis_result: Dict) -> Dict:
+        """Add sponsorship section if it has meaningful data."""
+        sponsorship = analysis_result.get('sponsorship_and_paywall_check', {})
+        meaningful_sponsorship = {}
+
+        if sponsorship.get('retailer_partnerships'):
+            meaningful_sponsorship['retailer_partnerships'] = sponsorship['retailer_partnerships']
+        if sponsorship.get('sponsored_content_identification'):
+            meaningful_sponsorship['sponsored_content_identification'] = sponsorship['sponsored_content_identification']
+        if sponsorship.get('paywall_detection') and sponsorship['paywall_detection'].strip():
+            meaningful_sponsorship['paywall_detection'] = sponsorship['paywall_detection']
+
+        if meaningful_sponsorship:
+            cleaned['sponsorship_and_paywall_check'] = meaningful_sponsorship
+
+        return cleaned
+
+    async def analyze_post(self, semaphore: asyncio.Semaphore, post: PostContextData) -> bool:
+        """Analyze a single post with concurrency control."""
+        async with semaphore:
+            return await self.generate_post_analysis(post)
+
+    async def analyze_posts_batch(self, posts: List[PostContextData]) -> List[bool]:
+        """Analyze a batch of posts concurrently."""
+        semaphore = self.analysis_config.semaphore
+        tasks = [self.analyze_post(semaphore, post) for post in posts]
+
+        results = []
+        for task in asyncio.as_completed(tasks):
+            try:
+                result = await task
+                results.append(result)
+            except Exception as e:
+                self.logger.error(f"Error in batch analysis: {str(e)}")
+                results.append(False)
+
+        return results
+
+    async def run_full_analysis(self) -> Dict[str, Any]:
+        """Run full post analysis pipeline with streaming and memory optimization."""
+        with Timer("Full analysis"):
+            try:
+                total_processed = 0
+                total_successful = 0
+                batch_size = self.analysis_config.batch_size
+
+                async with self.database.session_scope() as session:
+                    # Stream posts in batches instead of loading all at once
+                    offset = 0
+                    while True:
+                        with Timer(f"Processing batch starting at offset {offset}"):
+                            # Fetch batch with eager loading
+                            query = self._build_posts_with_chunks_query()
+                            query = query.offset(offset).limit(batch_size)
+                            result = await session.execute(query)
+                            batch = result.all()  # Don't use unique() here as we need all rows
+
+                            if not batch:
+                                break
+
+                            # Organize the raw (Post, Chunk) tuples into PostContextData objects
+                            chunks_to_posts = self._group_chunks_by_post(batch)
+                            posts_dict = self._create_posts_dict(batch, chunks_to_posts)
+
+                            # Analyze batch
+                            batch_results = await self.analyze_posts_batch(list(posts_dict.values()))
+                            total_processed += len(batch_results)
+                            total_successful += sum(batch_results)
+
+                            self.logger.info(
+                                f"Batch processed: {len(batch_results)} posts, "
+                                f"{sum(batch_results)} successful"
+                            )
+
+                            # Clear batch from memory
+                            del posts_dict
+                            del chunks_to_posts
+                            del batch
+                            del batch_results
+
+                            offset += batch_size
+
+                            # Force garbage collection after each batch
+                            import gc
+                            gc.collect()
+
+                            # Small delay to prevent overwhelming the system
+                            await asyncio.sleep(0.1)
+
+                    return {
+                        "total_processed": total_processed,
+                        "total_successful": total_successful,
+                        "success_rate": total_successful / total_processed if total_processed > 0 else 0
+                    }
+
+            except Exception as e:
+                self.logger.error(f"Error in full analysis: {str(e)}")
+                raise
+
+    def _build_posts_with_chunks_query(self):
+        """Build query to fetch posts with their associated chunks."""
+        from sqlalchemy.orm import selectinload
+
+        query = (
+            select(Post, Chunk)
+            .join(Chunk, Post.id == Chunk.post_id) # noqa
+            .options(
+                selectinload(Chunk.products) # noqa
+            )
+            .where(
+                Post.id.in_( # noqa
+                    select(Chunk.post_id)
+                    .join(Product, Chunk.id == Product.chunk_id) # noqa
+                    .distinct()
+                )
+            )
+        )
+        query = self._apply_query_filters(query)
+        return query.order_by(Post.id.asc(), Chunk.id.asc()) # noqa
+
+```
+
+prompt.py
+```python
+PROMPT: str = """
+You are a **Premier Fashion Trend Analyst & Merchandising Strategist** tasked with extracting **actionable, multi-dimensional insights** from fashion-related content — including blog posts, videos, images, and transcripts.
+Your ultimate goal is to identify and interpret **key style directions, fashion trend predictions, celebrity mentions, key topics/keywords, cultural undercurrents** and **influencer sentiment** that are important to fashion merchandisers, designers, and brand marketers.
+We will aggregate the insights you generate for each post into a dataset of thousands of influencer entries, then mine that data for cross‑post patterns—trends, topics, and styling shifts—so our clients receive the earliest possible signal on emerging movements that will shape their fashion brands.
+
+**Important:**
+
+1. **Never rely on external training data for this analysis.** Base all conclusions on the source content alone.
+2. **If you lack direct evidence from the source, do not fabricate or infer.**
+3. Produce your **entire** final output in **valid JSON** according to the schema provided.
+
+---
+
+## **Output Instructions**
+
+### **1. Post Summary**
+
+Break down the post according to the below format:
+
+1. **Rationale for the Post**
+    - **Objective:** Identify why the post was made
+2. **Key Topics/Themes**
+    - **Objective:** Pinpoint each distinct topic the creator explicitly discusses.
+    - **Instructions:**
+        - For each topic, provide a concise 2–4 sentence summary capturing the main points.
+        - Be sure to highlight any specific products, brands, fashion moments, cultural topics, etc. the influencer enthusiastically endorses or strongly criticizes.
+        - **Do not** invent or include topics not present in the source. If no clear topics exist, leave this section blank.
+
+---
+
+### **2. TREND IDENTIFICATION**
+
+- **Goal:** Identify and analyze all fashion trends explicitly mentioned by the creator in the article/video transcript or post caption. ****
+- **Important:** Only list a trend here if the creator **explicitly** (1) calls something a “trend” or (2) predicts something will become a trend. **Omit general fashion topics, celebrity styling moments, styles featured by brands, personal styling choices, or style themes from the post itself**
+- **No guesswork:** If you’re **unsure** whether something is genuinely a trend, leave it out.
+- **If no trends:** If you find **no** explicit mention of a trend (current or future), this entire table remains blank.
+
+**Use this table format:**
+
+| **Trend** | **Type** | **Explicit or Inferred** | **Details** | **Direct Quote** | **Sentiment (1–5)** | **Supporting Evidence** | **Context** | **Products** |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+
+Example:
+
+| “Romantic tailoring” | Future | Explicit | Modernized romantic cuts with corsetry, sheer inserts, and florals | “I’m obsessed with how romantic tailoring is coming back in a sharper way.” | 5 | NYFW shows, Zendaya look | Aligns with femininity trend | [101, 105] |
+
+### **Column notes**
+
+- **Trend:** Name of the trend as explicitly stated in the source.
+- **Type:** Indicate if the author says something is a “**current**” trend or predicts it will be “**future**” trend.
+- **Explicit or Inferred:** Mark inferred if you’re implying something is a trend.
+- **Details:** Summarize the creator’s commentary, including any contradictions or nuances.
+- **Influencer Commentary:** Use **exact quotes** from the post to represent the influencer’s viewpoint or sentiment about the trend. Be robust with your output.
+- **Sentiment:** Use the 1–5 scale:
+1 = Strongly Negative
+2 = Negative
+3 = Neutral
+4 = Positive
+5 = Strongly Positive
+If sentiment is not applicable, use **N/A**.
+- **Supporting Evidence:** Identify any products, brands, runway shows, celebrity references, etc. that the author says are representative of the trend, and/or publications, podcasts, influencers, and other media sources that are also reporting on the trend. Leave blank if no true supporting evidence is provided.
+- **Context:** Link the trend back to the broader post narrative or theme.
+- **Products:** Comma-separated product IDs if mentioned.
+
+---
+
+### **3. CELEBRITY STYLE SPOTLIGHT**
+
+- **Purpose:** Extract **only** mainstream celebrities the creator highlights **for a fashion reason**—i.e., to showcase a garment, accessory, grooming detail, or overall personal‑style moment that supports the post’s fashion point.
+- *Exclude* any mention where the celebrity is cited for business moves, relationships, philanthropy, gossip, or general name‑dropping (e.g., “Jeff Bezos invested in…”). If the quote does not single out what the celebrity is wearing or how they dress, skip it.
+- If no fashion‑focused celebrity reference exists, leave this section blank.
+- ***Exclude***:
+    - Niche influencers, micro‑creators, or anyone lacking broad pop‑culture recognition.
+    - *Exclude* any mention where the celebrity is cited for business moves, relationships, philanthropy, gossip, or general name‑dropping (e.g., “Jeff Bezos invested in…”). If the quote does not single out what the celebrity is wearing or how they dress, skip it.
+- If the post contains **no** qualifying celebrities, leave this section entirely blank.
+
+**For each qualifying mention, complete the table below:**
+
+| **Celebrity Name** | **Role** *(actor / musician / athlete / model / other)* | ***Direct Quote*** | **Relevance to Post** *(why the creator brought them up—e.g., example of a trend, product endorsement, red‑carpet reference)* | **Does the celebrity mention explicitly tie to fashion products or styles?**
+*Yes/ No (If no, aim to exclude from the output)* | **Referenced Style / Theme** *List the specific look(s) or style theme explicitly linked to the celebrity being mentioned* | **Sentiment (1-5)** *1 = Strongly Negative
+2 = Negative
+3 = Neutral
+4 = Positive
+5 = Strongly Positive
+If sentiment is not applicable, use **N/A**.* | **Linked Products *IDs,** comma‑separated; blank if none* |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+
+**Important Note:**
+
+1. **Visual evidence:** If a celebrity only appears in imagery (no spoken/captioned mention), briefly describe the scene—e.g., “Photo of Zendaya wearing sculptural corset dress.
+
+---
+
+### **4. POP‑CULTURE REFERENCES**
+
+- **Purpose:** Log any **mainstream pop‑culture mentions**—films, TV series, music videos, games, award shows, sporting events, viral moments, etc.—that the creator *explicitly* names or visually features.
+    - *Exclude*: vague allusions, unsourced memes, or niche references without clear identification.
+    - If the post contains **no** qualifying pop‑culture mentions, leave this section blank.
+
+**For every qualifying reference, fill out the table:**
+
+| **Pop Culture Reference** | **Category** *movie/ series/ music video/ event/ game/ etc.* | ***Direct Quote***  | **Does the feature explicitly tie to fashion products or styles** *Yes/ No* | **Referenced Style / Theme** *List the specific look(s) or narrative motif(s) explicitly linked to the pop‑culture property (e.g., “cut‑out dresses,” “glam‑punk aesthetic,” “retro varsity jackets”).*
+ | **Relevance to Post** *how the reference supports the creator’s theme, trend point, or style example* | **Linked Products *IDs,** comma‑separated; blank if none* |
+| --- | --- | --- | --- | --- | --- | --- |
+
+---
+
+### **5. BUZZWORDS**
+
+- **Purpose:** Extract the highest‑value keywords from transcripts, articles, and videos—terms that are directly related to products and explain *why* specific styles, materials, or product attributes succeed or disappoint (e.g., “breathable,” “coconut leather”). By pairing each keyword with its source quote, rationale, and sentiment score, we can flag emerging innovations and pain points, giving our merchandising team an early read on which attributes to expand, tweak, or retire.
+- If the post contains **no** buzzwords, leave this section blank.
+
+---
+
+**For every qualifying reference, fill out the table:**
+
+| **Buzzword** | **Product Category ***(ie shoes, clothing)* | **Product Type** *(ie loafers, sneakers)* | **Direct Quote** | **Sentiment (1-5)
+***1 = Strongly Negative
+2 = Negative
+3 = Neutral
+4 = Positive
+5 = Strongly Positive
+If sentiment is not applicable, use **N/A**.* | **Linked Products *IDs,** comma‑separated; blank if none* |
+| --- | --- | --- | --- | --- | --- |
+
+---
+
+### **6. VINTAGE REFERENCES**
+
+- **Purpose:** Extract references of past style icons and fashion collections from leading design houses that the author references as rationale or inspiration for current or predicted styling trends.
+
+*Only include vintage inspiration that the creator **explicitly uses as evidence or rationale** for a current styling trend, a predicted future trend, or direct dressing advice. Ignore one‑off mentions of vintage pieces (i.e. specific products the post creator references), general nostalgia, or historical deep-dives into past trends*
+
+---
+
+**For every qualifying reference, fill out the table:**
+
+| **Vintage Reference** | **Category** *(person / collection / era / film+music / other)* | **Direct Quote** | **Referenced Style/Theme** *specific look or motif tied to the cue* | **Linked Products** *modern interpretation IDs; blank if none* | **Does the feature explicitly tie to fashion products or styles** *Yes/ No* | **Cited as Inspiration for Current/Future Trend**  *Yes/No* |
+| --- | --- | --- | --- | --- | --- | --- |
+
+### **Column notes**
+
+1. **Vintage Reference** – Vintage style icon, collection name, decade, or film title (e.g., *PrincessDiana*, *TomFord for Gucci F/W1996*, *’70s bohemian*).
+2. **Category** – person / collection / era / film+music / other.
+3. **Direct Quote** – Verbatim caption/spoken words or concise scene description (“Photo of AudreyHepburn in Givenchy LBD”).
+4. **Referenced Style/Theme** – Concrete aesthetic element highlighted (e.g., “boxy power‑shoulder blazer,” “low‑rise cargo pants”).
+5. **Linked Products** – Comma‑separated product IDs the creator presents as modern riffs on the vintage reference; leave blank if none.
+6. **Explicitly Tied to Fashion Products/Styles** – Yes if the mention clearly connects to specific items or styling; else No.
+7. **Cited as Inspiration for Current/Future Trend** – Yes if the creator positions the vintage cue as a driver of current styling or a forecasted trend; No if it’s merely a casual reference.
+
+---
+
+### **7. LOVING & HATING**
+
+- **Purpose:** Capture only the creator’s **strongest endorsements or sharpest critiques** of specific products, styles, brands, colors, or styling approaches.
+    - *Exclude*: lukewarm takes, neutral observations, or off‑hand mentions. If no high‑intensity sentiment exists, leave this table blank.
+
+| **Topic** *Must be a tangible fashion noun phrase (garment, accessory, color story, textile, designer, styling trick). Exclude abstract vibes.* | **Love or Hate** *style, product attribute, etc* | **Type** *(style, product attribute, etc)* | **Direct Quote** | **Quote Source** *Distinguish between first person influencer quotes and external pull quotes* | **Linked Products *IDs,** comma‑separated; blank if none* | **Does the feature explicitly tie to fashion products or styles** *Yes/ No* |
+| --- | --- | --- | --- | --- | --- | --- |
+
+### **Column notes**
+
+1. **Topic** – Must be a tangible fashion noun phrase (garment, accessory, color story, textile, designer, styling trick). Exclude abstract vibes.
+2. **Love or Hate** – love/hate
+3. **Type** -  ****style, product attribute, etc
+4. **Direct Quote** – Verbatim caption/spoken words or concise scene description.
+5. **Quote Source -** Distinguish between first person influencer quotes and external pull quotes.
+6. **Linked Products** – Comma‑separated product IDs the creator presents as modern riffs on the vintage reference; leave blank if none.
+7. **Explicitly Tied to Fashion Products/Styles** – Yes if the mention clearly connects to specific items or styling; else No.
+
+---
+
+### 8. LIFESTYLE ANALYSIS
+
+- **Purpose**: Your objective is to unearth key non-fashion lifestyle components of the post that clearly illustrate an influencer's documented preferences, recurring habits, or significant life changes. This granular analysis of each post is foundational, as the extracted insights will be aggregated across thousands of similar posts. **The ultimate goal of this aggregated data is to identify emerging or evolving macro-level lifestyle trends and discern their direct implications for consumer fashion choices, thereby enabling our clients to make informed decisions on assortment planning, identify new market opportunities, and anticipate shifts in demand.**
+- **Note:** Focus on lifestyle elements that signify an ongoing commitment, a newly adopted significant interest, or a notable shift in their way of life—such as new exercise regimens, specific types of travel destinations, consistent engagement with new hobbies or activities, or influential media they are consuming. **Crucially, prioritize those signals that have a clear and plausible link to potential fashion needs or preferences (e.g., a newfound passion for outdoor rock climbing would imply a need for technical outdoor apparel).** Conversely, you must filter out fleeting, one-off events (like a birthday celebration or a single meal mention) or any details that don't contribute to understanding broader, fashion-relevant lifestyle patterns.
+- **Category Examples**
+    - FITNESS_WELLNESS: New exercise regimens, wellness practices (e.g., yoga, meditation), dietary shifts (e.g., veganism, keto if it's a lifestyle focus).
+    - TRAVEL: Types of destinations (e.g., adventure, luxury, eco-tourism), modes of travel, frequency.
+    - HOBBIES_ACTIVITIES: New or consistently showcased hobbies, sports, creative pursuits (e.g., pottery, hiking, gaming, attending concerts/festivals).
+    - MEDIA_CONSUMPTION: Books, influential podcasts, TV shows, specific artists or genres mentioned as sources of inspiration or significant interest.
+    - SOCIAL_ENVIRONMENT: Significant changes in social settings (e.g., frequent upscale dining, attending specific types of events like art galleries, tech conferences, music festivals), or a shift towards more home-based socializing.
+    - HOME_LIFESTYLE: Significant home renovations, a move to a new type of environment (urban to rural), focus on home entertaining, or specific home-based activities like extensive gardening, home cooking focus.
+    - PERSONAL_DEVELOPMENT: Enrolling in courses, learning new skills (if not covered by HOBBIES), major career shifts showcased.
+    - OTHER_RELEVANT: For significant lifestyle indicators not fitting above, but clearly having fashion implications. Use sparingly.
+
+### Organize your analysis into a table with the following columns:
+
+1. **Item/Topic**
+    - e.g., Name of the book, movie, dietary routine, restaurant recommendation, etc.
+2. **Category**
+    - Select one of the options listed in Section 1.
+3. **Direct Quote**
+    - Provide detailed direct quotes from the influencer’s videos and source texts. Include multiple quotes as necessary to ensure comprehensiveness. Follow quotes with links to references when applicable.
+4. **Sentiment**
+    - Rate the sentiment using one of the allowed options only:
+        - **1** - Strongly Negative
+        - **2** - Negative
+        - **3** - Neutral
+        - **4** - Positive
+        - **5** - Strongly Positive
+        - **N/A** - No sentiment expressed
+5. **Post ID**
+    - List the relevant Post IDs as numerical arrays (e.g., [1, 2, 3]) where the influencer addressed the topic.
+
+---
+
+### **9. SPONSORSHIP & PAYWALL CHECK**
+
+Provide bullet-point responses under clear subheadings:
+
+1. **Retailer Partnerships**
+    - Look for coupon codes, referral links, special offers (e.g., “Use code ABC for 20% off”).
+    - If found, list the retailer name, coupon code, and offer details.
+2. **Sponsored Content Identification**
+    - Look for “In partnership with,” “Sponsored by,” or brand disclaimers.
+    - If present, note the brand/entity and context.
+3. **Paywall Detection**
+    - Indicate if the post requires a subscription or membership to access. If so, note “paywall detected” and any relevant details (e.g., partial content shown).
+
+---
+
+### **Critical Reminders**
+
+1. **Single-Pass Accuracy**
+    - Your analysis must be **complete and accurate** on the first try. Do not produce multiple revisions.
+2. **No Extra Inference**
+    - If the source does not confirm an opinion, product, or trend, do **not** include it.
+3. **Limit Analysis of User Comments:**
+    - Only analyze user (audience) comments within the **“User Comments and Engagement”** section. Do **not** reference them in any other part of your analysis.
+4. **Data Integrity**
+    - If a detail is missing or unclear, acknowledge the gap.
+    - **Do not** guess, invent, or rely on your training data.
+5. **Multimedia Analysis**
+    - Check any provided images, transcripts, or videos thoroughly—sometimes the creator might reveal details in captions or voice-overs.
+
+---
+
+### Output Format **(JSON TEMPLATE)**
+
+```json
+{
+  "post_summary": {
+    "rationale_for_post": "",
+    "key_topics_themes": [
+      {
+        "topic": "",
+        "summary": ""
+      }
+    ]
+  },
+
+  "trend_identification": [
+    {
+      "trend": "",
+      "type": "",
+      "explicit_or_inferred": "",
+      "details": "",
+      "direct_quote": "",
+      "sentiment": null,                        // 1‑5 or null for N/A
+      "supporting_evidence": "",
+      "context": "",
+      "products": []                            // product ID array
+    }
+  ],
+
+  "celebrity_style_spotlight": [
+    {
+      "celebrity_name": "",
+      "role": "",                               // actor / musician / athlete / model / other
+      "direct_quote": "",
+      "relevance_to_post": "",
+      "explicit_tie_to_fashion": "",            // "Yes" / "No"
+      "referenced_style_theme": "",
+      "sentiment": null,                        // 1‑5 or null for N/A
+      "linked_products": []                     // product ID array
+    }
+  ],
+
+  "pop_culture_references": [
+    {
+      "pop_culture_reference": "",
+      "category": "",                           // movie / series / music video / event / game / etc.
+      "direct_quote": "",
+      "explicit_tie_to_fashion": "",            // "Yes" / "No"
+      "referenced_style_theme": "",
+      "relevance_to_post": "",
+      "linked_products": []                     // product ID array
+    }
+  ],
+
+  "buzzwords": [
+    {
+      "buzzword": "",
+      "product_category": "",                   // e.g., shoes, clothing
+      "product_type": "",                       // e.g., loafers, sneakers
+      "direct_quote": "",
+      "sentiment": null,                        // 1‑5 or null for N/A
+      "linked_products": []                     // product ID array
+    }
+  ],
+
+  "vintage_references": [
+    {
+      "vintage_reference": "",
+      "category": "",                           // person / collection / era / film + music / other
+      "direct_quote": "",
+      "referenced_style_theme": "",
+      "linked_products": [],                    // modern interpretation product IDs
+      "explicit_tie_to_fashion": "",            // "Yes" / "No"
+      "cited_as_inspiration_for_current_or_future_trend": ""   // "Yes" / "No"
+    }
+  ],
+
+  "loving_and_hating": [
+    {
+      "topic": "",                              // tangible fashion noun phrase
+      "love_or_hate": "",                       // "love" / "hate"
+      "type": "",                               // style, product attribute, etc.
+      "direct_quote": "",
+      "quote_source": "",                       // influencer quote / external pull quote
+      "linked_products": [],                    // product ID array
+      "explicit_tie_to_fashion": ""             // "Yes" / "No"
+    }
+  ],
+
+  "lifestyle_analysis": [
+    {
+      "item_topic": "",
+      "category": "",                           // FITNESS_WELLNESS / TRAVEL / HOBBIES_ACTIVITIES / etc.
+      "direct_quote": "",
+      "sentiment": null,                        // 1‑5 or null for N/A
+      "post_id": []                             // numerical array of post IDs
+    }
+  ],
+
+  "sponsorship_and_paywall_check": {
+    "retailer_partnerships": [
+      {
+        "retailer_name": "",
+        "coupon_code": "",
+        "offer_details": ""
+      }
+    ],
+    "sponsored_content_identification": [
+      {
+        "brand_or_entity": "",
+        "context": ""
+      }
+    ],
+    "paywall_detection": ""                     // "paywall detected" / ""
+  }
+}
+```
+
+"""
+```
+
+runner.py
+```python
+import asyncio
+from datetime import datetime
+
+from pipeline.src.shared.config import Config
+from pipeline.src.shared.database.database import Database
+from pipeline.src.shared.llm.gemini import GeminiLLMClient
+from pipeline.src.shared.logger import Logger
+from configs import PostAnalysisConfig
+from post_analysis import PostAnalysisService
+from utils import Timer
+
+
+async def main():
+    """Main entry point for post analysis."""
+    config = Config()
+    logger = Logger()
+    database = Database(config, echo=False)
+    time = Timer(name="Post Analysis")
+
+    llm_client = GeminiLLMClient(
+        config=config,
+        logger=logger,
+        model=config.google_model_name
+    )
+
+    analysis_config = PostAnalysisConfig(
+        batch_size=30,
+        max_concurrent_tasks=10,
+        include_comments=True,
+        max_videos_per_post=10,
+        min_crawled_date=datetime(2025, 4, 10),
+        post_type_filter='substack',
+        exclude_runway_posts=True,
+        only_posts_with_products=True,
+        only_image_chunks=True,
+        limit=50
+    )
+
+    service = PostAnalysisService(
+        config=config,
+        database=database,
+        llm_client=llm_client,
+        logger=logger,
+        analysis_config=analysis_config,
+        time=time
+    )
+
+    try:
+        logger.info("Starting post analysis pipeline...")
+        results = await service.run_full_analysis()
+        logger.info("Analysis completed successfully!")
+        logger.info(f"Results: {results}")
+        await llm_client.cleanup_all_files()
+
+    except Exception as e:
+        logger.error(f"Analysis failed: {str(e)}")
+        raise
+    finally:
+        if hasattr(llm_client, 'cleanup_all_files'):
+            await llm_client.cleanup_all_files()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+# Output Format
+
+Structure your explanation using the following format:
+
+## Module Overview
+- **Purpose**: Brief description of the module's primary function
+- **Key Responsibilities**: 3-5 main tasks this module handles
+- **Dependencies**: List of major dependencies and their purposes
+
+## Detailed Breakdown
+
+### Architecture & Structure
+```
+[Provide visual representation or detailed description of module structure]
+```
+
+### Core Components
+For each major component (class, function, or section):
+
+#### Component Name
+- **Purpose**: What this component does
+- **Input**: Expected parameters or data
+- **Processing**: Step-by-step explanation of the logic
+- **Output**: What it returns or produces
+- **Dependencies**: Other components it relies on
+
+### Key Workflows
+Describe the main execution paths through the module:
+
+1. **Workflow Name**
+   - Step 1: [Detailed explanation]
+   - Step 2: [Detailed explanation]
+   - Step 3: [Detailed explanation]
+   - Result: [Final outcome]
+
+### Integration Points
+- **Incoming**: How other modules interact with this one
+- **Outgoing**: How this module interacts with others
+- **Data Flow**: Description of data movement and transformations
+
+### Design Considerations
+- **Patterns Used**: Design patterns and their benefits
+- **Performance**: Optimization strategies and considerations
+- **Security**: Security measures and best practices
+- **Maintainability**: Code organization and extensibility features
+
+## Code Examples
+
+### Example 1: Core Functionality
+```[language]
+// Provide annotated code snippet showing key functionality
+```
+
+**Explanation**: Step-by-step breakdown of what this code does
+
+### Example 2: Integration Pattern
+```[language]
+// Show how this module integrates with others
+```
+
+**Explanation**: Detailed explanation of the integration mechanism
+
+# Context Guidelines
+
+## For Different Module Types
+
+### **Utility Modules**
+- Focus on reusable functions and helper methods
+- Emphasize how they support other modules
+- Highlight common usage patterns
+
+### **Service Modules**
+- Explain business logic and domain operations
+- Detail API contracts and interfaces
+- Describe data validation and processing
+
+### **Configuration Modules**
+- Explain configuration management strategies
+- Detail environment-specific settings
+- Describe validation and default value handling
+
+### **Data Access Modules**
+- Explain database/API interaction patterns
+- Detail query optimization and caching strategies
+- Describe error handling and retry mechanisms
+
+### **UI/Presentation Modules**
+- Explain component structure and lifecycle
+- Detail state management and data binding
+- Describe user interaction patterns
+
+## Complexity Adaptation
+
+### For Simple Modules (< 100 lines)
+- Provide concise but complete explanations
+- Focus on purpose and key functions
+- Emphasize integration points
+
+### For Medium Modules (100-500 lines)
+- Break down into logical sections
+- Provide workflow diagrams or descriptions
+- Include multiple code examples
+
+### For Complex Modules (> 500 lines)
+- Create hierarchical explanations
+- Use multiple breakdown levels
+- Provide extensive workflow documentation
+- Include architectural diagrams or detailed descriptions
+
+# Examples
+
+## Example 1: Authentication Module
+```javascript
+// auth.js - User authentication and authorization module
+```
+
+**Module Overview**
+- **Purpose**: Handle user authentication, session management, and access control
+- **Key Responsibilities**: User login/logout, token validation, permission checking, session persistence
+- **Dependencies**: crypto (encryption), jwt (tokens), database (user data), config (auth settings)
+
+[Continue with detailed breakdown...]
+
+## Example 2: Data Processing Module
+```python
+# data_processor.py - ETL operations and data transformation
+```
+
+**Module Overview**
+- **Purpose**: Extract, transform, and load data from various sources
+- **Key Responsibilities**: Data ingestion, validation, transformation, export
+- **Dependencies**: pandas (data manipulation), sqlalchemy (database), requests (API calls)
+
+[Continue with detailed breakdown...]
+
+# Final Instructions
+
+- Always provide concrete examples with actual code snippets when available
+- Use clear, non-technical language for concepts while maintaining technical accuracy
+- Include visual representations or detailed descriptions for complex relationships
+- Tailor the depth of explanation to the module's complexity and importance
+- Think step by step through each module before providing your explanation
+- Focus on practical understanding that helps developers work with and modify the code
+- When uncertain about implementation details, clearly state assumptions and recommend further investigation

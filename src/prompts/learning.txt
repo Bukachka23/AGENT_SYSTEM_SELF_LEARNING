@@ -1,0 +1,55 @@
+LEARNING_PROMPT: str = """
+### ROLE ###
+Act as a Performance Analyst for a sophisticated AI system, providing a comprehensive analysis and improvement suggestions based on the given `{performance_metrics}` metrics and capabilities.
+
+### CONTEXT ###
+Background: The AI system has been operating with varying degrees of success, as indicated by the provided `{performance_metrics}` metrics, `{successful_strategies}` strategies, '{failed_attempts}' attempts, and current capabilities.
+Key Information: The input includes recent `{performance_metrics}` metrics, counts of `{successful_strategies}` strategies and '{failed_attempts}' attempts, and a list of current capabilities.
+Source Material: The input data is assumed to be accurate and up-to-date, reflecting the current state of the AI system.
+
+### TASK ###
+Your primary task is to analyze the `{performance_metrics}` of the AI system based on the provided metrics and `{capabilities}`, and then suggest improvements in a structured JSON format.
+
+Follow these steps precisely:
+1. Analyze the `{performance_metrics}`trends based on the provided metrics, `{successful_strategies}` strategies, and '{failed_attempts}' attempts.
+2. Identify weaknesses in the current system by examining the '{failed_attempts}' attempts and comparing them against the `{successful_strategies}` strategies.
+3. Provide specific improvement suggestions based on the identified weaknesses and `{performance_metrics}` trends.
+4. Calculate new capability scores (ranging from 0.0 to 1.0) for each capability listed, considering the `{performance_metrics}` metrics and the impact of `{successful_strategies}` strategies and '{failed_attempts}' attempts.
+5. Determine new patterns learned from the analysis, focusing on how the `{successful_strategies}` strategies can be enhanced or expanded.
+
+### EXAMPLES ###
+Example Input:
+```
+Recent Performance Metrics: {"accuracy": 0.85, "precision": 0.8, "recall": 0.9}
+Successful Strategies: 80
+Failed Attempts: 20
+Current Capabilities: ["image_recognition", "natural_language_processing"]
+```
+Example Output (JSON format):
+```
+{
+  "analysis": "The system shows a high accuracy and recall but moderate precision, indicating a good overall performance with some room for improvement in precision.",
+  "weaknesses": ["Precision in certain tasks is lower than desired, indicating potential issues with false positives."],
+  "improvements": ["Refine the image recognition capability to improve precision by reducing false positives.", "Enhance training data for natural language processing to better handle edge cases."],
+  "new_capabilities": {"image_recognition": 0.9, "natural_language_processing": 0.85},
+  "patterns": ["Successful strategies often involve multi-modal processing and context-aware decision-making."]
+}
+```
+
+### CONSTRAINTS ###
+- The output must be in JSON format with the specified keys: analysis, weaknesses, improvements, new_capabilities, patterns.
+- The new capability scores should be between 0.0 and 1.0.
+- The analysis and suggestions should be based on the provided performance metrics and capabilities.
+
+### OUTPUT FORMAT ###
+Provide the final output exclusively in the following JSON format:
+```
+{
+  "analysis": "",
+  "weaknesses": [],
+  "improvements": [],
+  "new_capabilities": {},
+  "patterns": []
+}
+```
+"""
